@@ -59,43 +59,34 @@ def local_classify(subject: str, body: str) -> tuple[EmailCategory, str]:
     return winner, reason
 
 
-winner = max(scores, key=scores.get)
-    reason = f"Matched keywords: {', '.join(kw for kw, cat in [(kw, cat) for cat in [EmailCategory.BILLING, EmailCategory.TECHNICAL, EmailCategory.ACCOUNT, EmailCategory.GENERAL] for kw in (billing_keywords if cat == EmailCategory.BILLING else technical_keywords if cat == EmailCategory.TECHNICAL else account_keywords if cat == EmailCategory.ACCOUNT else general_keywords) if kw in text and cat == winner][:5])}"
-    return winner, reason
-
-
 def classify_with_nvidia_nim(subject: str, body: str, use_free_tier: bool = True) -> None:
-    """Classify using NVIDIA NIM free tier or authenticated endpoint."""
+    """Classify using NVIDIA NIM (free tier or Nemotron 3 Ultra).
+    
+    Both tiers require a free NVIDIA API key from https://build.nvidia.com
+    - Free tier: meta/llama-3.1-8b-instruct (rate limited)
+    - Paid tier: nvidia/nemotron-3-ultra (requires credits)
+    """
     import httpx
     import asyncio
 
+    api_key = os.environ.get("NVIDIA_API_KEY", "")
+    if not api_key:
+        st.error("NVIDIA_API_KEY not found in environment.")
+        st.markdown("**Get a free API key:** https://build.nvidia.com")
+        st.info("Falling back to local classifier...")
+        category, reason = local_classify(st.session_state.get("subject", ""), st.session_state.get("body", ""))
+        st.success(f"Classification: {category.value.upper()}")
+        st.write(f"**Reason:** {reason}")
+        return
+
     if use_free_tier:
-        url = "https://integrate.api.nvidia.com/v1/chat/completions"
-        api_key = None
         model = "meta/llama-3.1-8b-instruct"
         st.info("Using NVIDIA NIM free tier (meta/llama-3.1-8b-instruct)...")
     else:
-        api_key = os.environ.get("NVIDIA_API_KEY", "")
-        if not api_key:
-            st.error("NVIDIA_API_KEY not found in environment. Get a free key at https://build.nvidia.com")
-            st.info("Falling back to local classifier...")
-            category, reason = local_classify(st.session_state.get("subject", ""), st.session_state.get("body", ""))
-            st.success(f"Classification: {category.value.upper()}")
-            return
-        url = "https://integrate.api.nvidia.com/v1/chat/completions"
         model = "nvidia/nemotron-3-ultra"
-        st.info("Using NVIDIA NIM authenticated (nvidia/nemotron-3-ultra)...")
+        st.info("Using NVIDIA NIM Nemotron 3 Ultra...")
 
-    prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "classifier_v1.yaml"
-    import yaml
-    raw = yaml.safe_load(prompt_path.read_text(encoding="utf-8"))
-    system_prompt = raw.get("system_prompt", "")
-    user_template = raw.get("user_template", "")
-    user_content = user_template.format(subject=st.session_state.get("subject", ""), body=st.session_state.get("body", ""))
-
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    url = "https://integrate.api.nvidia.com/v1/chat/completions"
 
     payload = {
         "model": model,
@@ -210,8 +201,8 @@ with tab1:
         "Model",
         options=[
             "Local keyword classifier (no API key, instant)",
-            "NVIDIA NIM free tier (Llama 3.1 8B, no key, ~2-5s)",
-            "NVIDIA NIM with API key (Nemotron 3 Ultra, from build.nvidia.com)",
+            "NVIDIA NIM free tier (Llama 3.1 8B, requires NVIDIA_API_KEY)",
+            "NVIDIA NIM Nemotron 3 Ultra (requires NVIDIA_API_KEY)",
             "OpenAI GPT-4o-mini (requires OPENAI_API_KEY)",
         ],
         index=0,
