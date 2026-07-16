@@ -8,6 +8,7 @@ sys.path.insert(0, "..")
 import os
 import json
 import asyncio
+import httpx
 from pathlib import Path
 
 import streamlit as st
@@ -58,6 +59,145 @@ def local_classify(subject: str, body: str) -> tuple[EmailCategory, str]:
     return winner, reason
 
 
+winner = max(scores, key=scores.get)
+    reason = f"Matched keywords: {', '.join(kw for kw, cat in [(kw, cat) for cat in [EmailCategory.BILLING, EmailCategory.TECHNICAL, EmailCategory.ACCOUNT, EmailCategory.GENERAL] for kw in (billing_keywords if cat == EmailCategory.BILLING else technical_keywords if cat == EmailCategory.TECHNICAL else account_keywords if cat == EmailCategory.ACCOUNT else general_keywords) if kw in text and cat == winner][:5])}"
+    return winner, reason
+
+
+def classify_with_nvidia_nim(subject: str, body: str, use_free_tier: bool = True) -> None:
+    """Classify using NVIDIA NIM free tier or authenticated endpoint."""
+    import httpx
+    import asyncio
+
+    if use_free_tier:
+        url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        api_key = None
+        model = "meta/llama-3.1-8b-instruct"
+        st.info("Using NVIDIA NIM free tier (meta/llama-3.1-8b-instruct)...")
+    else:
+        api_key = os.environ.get("NVIDIA_API_KEY", "")
+        if not api_key:
+            st.error("NVIDIA_API_KEY not found in environment. Get a free key at https://build.nvidia.com")
+            st.info("Falling back to local classifier...")
+            category, reason = local_classify(st.session_state.get("subject", ""), st.session_state.get("body", ""))
+            st.success(f"Classification: {category.value.upper()}")
+            return
+        url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        model = "nvidia/nemotron-3-ultra"
+        st.info("Using NVIDIA NIM authenticated (nvidia/nemotron-3-ultra)...")
+
+    prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "classifier_v1.yaml"
+    import yaml
+    raw = yaml.safe_load(prompt_path.read_text(encoding="utf-8"))
+    system_prompt = raw.get("system_prompt", "")
+    user_template = raw.get("user_template", "")
+    user_content = user_template.format(subject=st.session_state.get("subject", ""), body=st.session_state.get("body", ""))
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 50,
+    }
+
+    status = st.empty()
+    status.write("Calling NVIDIA NIM...")
+
+    async def call_nim():
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+    try:
+        result = asyncio.run(call_nim())
+        raw = result["choices"][0]["message"]["content"].strip().lower()
+        for cat in EmailCategory:
+            if raw.startswith(cat.value) or raw == cat.value:
+                category = cat
+                break
+        else:
+            category = EmailCategory.GENERAL
+
+        st.success(f"Classification: {category.value.upper()}")
+        st.write(f"**Model used:** {model}")
+        st.write(f"**Raw output:** {raw}")
+
+    except Exception as exc:
+        st.error(f"NVIDIA NIM call failed: {exc}")
+        st.info("Falling back to local classifier...")
+        category, reason = local_classify(st.session_state.get("subject", ""), st.session_state.get("body", ""))
+        st.success(f"Classification: {category.value.upper()}")
+        st.write(f"**Reason:** {reason}")
+
+
+def classify_with_openai(subject: str, body: str) -> None:
+    """Classify using OpenAI GPT-4o-mini."""
+    import httpx
+    import asyncio
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        st.error("OPENAI_API_KEY not found in environment. Add it to your .env file or environment variables.")
+        st.info("Falling back to local classifier...")
+        category, reason = local_classify(st.session_state.get("subject", ""), st.session_state.get("body", ""))
+        st.success(f"Classification: {category.value.upper()}")
+        st.write(f"**Reason:** {reason}")
+        return
+
+    prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "classifier_v1.yaml"
+    import yaml
+    raw = yaml.safe_load(prompt_path.read_text(encoding="utf-8"))
+    system_prompt = raw.get("system_prompt", "")
+    user_template = raw.get("user_template", "")
+    user_content = user_template.format(subject=st.session_state.get("subject", ""), body=st.session_state.get("body", ""))
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 50,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    async def call_openai():
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+    try:
+        result = asyncio.run(call_openai())
+        raw = result["choices"][0]["message"]["content"].strip().lower()
+        for cat in EmailCategory:
+            if raw.startswith(cat.value) or raw == cat.value:
+                category = cat
+                break
+        else:
+            category = EmailCategory.GENERAL
+
+        st.success(f"Classification: {category.value.upper()}")
+        st.write(f"**Model:** gpt-4o-mini")
+        st.write(f"**Raw output:** {raw}")
+
+    except Exception as exc:
+        st.error(f"OpenAI call failed: {exc}")
+        st.info("Falling back to local classifier...")
+        category, reason = local_classify(st.session_state.get("subject", ""), st.session_state.get("body", ""))
+        st.success(f"Classification: {category.value.upper()}")
+        st.write(f"**Reason:** {reason}")
+
+
 with tab1:
     st.subheader("Classify an Email")
     st.markdown("Paste an email below and the system will classify it into billing, technical, account, or general.")
@@ -66,44 +206,28 @@ with tab1:
     subject = col1.text_input("Email Subject", value="Invoice shows double charge for July")
     body = col2.text_area("Email Body", value="Hi, I just checked my July invoice and it looks like I was charged twice for the same subscription period. Can you look into this and issue a refund for the duplicate charge?", height=100)
 
-    use_llm = st.checkbox("Use real LLM (requires OPENAI_API_KEY in .env)", value=False)
-
-    if use_llm:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            st.warning("OPENAI_API_KEY not found in environment. Using local classifier instead.")
-            use_llm = False
+    model_choice = st.selectbox(
+        "Model",
+        options=[
+            "Local keyword classifier (no API key, instant)",
+            "NVIDIA NIM free tier (Llama 3.1 8B, no key, ~2-5s)",
+            "NVIDIA NIM with API key (Nemotron 3 Ultra, from build.nvidia.com)",
+            "OpenAI GPT-4o-mini (requires OPENAI_API_KEY)",
+        ],
+        index=0,
+    )
 
     if st.button("Classify Email", type="primary"):
-        if use_llm:
-            try:
-                prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "classifier_v1.yaml"
-                import yaml
-                raw = yaml.safe_load(prompt_path.read_text(encoding="utf-8"))
-                config = PromptConfig.model_validate(raw)
-
-                from src.regressor import LLMClient
-                llm = LLMClient(api_key=api_key)
-                result = asyncio.run(llm.classify(config, subject, body))
-
-                if result.predicted_category:
-                    st.success(f"Classification: {result.predicted_category.value.upper()}")
-                    st.write(f"**Model:** {config.model}")
-                    st.write(f"**Raw output:** {result.raw_output}")
-                    st.write(f"**Latency:** {result.latency_ms:.0f}ms")
-                    st.write(f"**Tokens used:** {result.token_count}")
-                else:
-                    st.error(f"Could not parse model output: {result.raw_output}")
-            except Exception as exc:
-                st.error(f"LLM call failed: {exc}")
-                st.info("Falling back to local classifier.")
-                category, reason = local_classify(subject, body)
-                st.success(f"Classification: {category.value.upper()}")
-                st.write(f"**Reason:** {reason}")
-        else:
+        if "Local keyword" in model_choice:
             category, reason = local_classify(subject, body)
             st.success(f"Classification: {category.value.upper()}")
             st.write(f"**Reason:** {reason}")
+        elif "NVIDIA NIM free" in model_choice:
+            classify_with_nvidia_nim(subject, body, use_free_tier=True)
+        elif "NVIDIA NIM with API" in model_choice:
+            classify_with_nvidia_nim(subject, body, use_free_tier=False)
+        elif "OpenAI" in model_choice:
+            classify_with_openai(subject, body)
 
         category_info = {
             EmailCategory.BILLING: ("Questions about invoices, charges, payments, refunds, or subscription plans.", "#4a9eff"),
